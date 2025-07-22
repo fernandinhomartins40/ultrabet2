@@ -327,6 +327,18 @@ app.get('/api/info', (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`Supabase Panel Backend running on port ${PORT}`);
+// Add debug info
+console.log('=== Supabase Panel Backend ===');
+console.log('NODE_ENV:', process.env.NODE_ENV);
+console.log('PORT:', PORT);
+console.log('VPS_IP:', VPS_IP);
+console.log('DATA_FILE:', DATA_FILE);
+console.log('DOCKER_PATH:', DOCKER_PATH);
+console.log('===============================');
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Supabase Panel Backend running on 0.0.0.0:${PORT}`);
+  console.log(`🌐 Access: http://${VPS_IP}:${PORT}`);
+  console.log(`📁 Data: ${DATA_FILE}`);
+  console.log(`🐳 Docker: ${DOCKER_PATH}`);
 }); 
