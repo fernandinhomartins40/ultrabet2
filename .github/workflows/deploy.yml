@@ -1,0 +1,326 @@
+name: Deploy Supabase Panel to VPS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  VPS_HOST: '82.25.69.57'
+  VPS_USER: 'root'
+  APP_DIR: '/opt/supabase-panel'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Deploy to VPS
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ env.VPS_HOST }}
+        username: ${{ env.VPS_USER }}
+        password: ${{ secrets.VPS_PASSWORD }}
+        port: 22
+        timeout: 600s
+        command_timeout: 600s
+        script: |
+          # Função de log
+          log() {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+          }
+          
+          # ====================================
+          # ETAPA 1: PREPARAR AMBIENTE
+          # ====================================
+          log "🚀 INICIANDO DEPLOY SUPABASE PANEL - ETAPA 1: Preparando ambiente..."
+          
+          # Configurações
+          APP_DIR="${{ env.APP_DIR }}"
+          REPO_URL="https://github.com/${{ github.repository }}.git"
+          
+          # Parar containers existentes ANTES de qualquer operação
+          log "⏹️ Parando containers e serviços existentes..."
+          
+          # Parar containers Docker existentes
+          docker stop $(docker ps -aq) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          
+          # Parar processos Node.js existentes
+          pkill -f "node.*server.js" || true
+          pkill -f "npm.*start" || true
+          pkill -f "npm.*dev" || true
+          
+          # Criar diretório e navegar
+          mkdir -p $APP_DIR
+          cd $APP_DIR
+          
+          # ====================================
+          # ETAPA 2: BAIXAR/ATUALIZAR CÓDIGO
+          # ====================================
+          log "🚀 ETAPA 2: Baixando código do repositório..."
+          
+          # Limpar diretório
+          rm -rf * .git 2>/dev/null || true
+          
+          # Clonar repositório
+          log "📥 Clonando repositório..."
+          git clone $REPO_URL . || {
+            log "❌ Clone falhou, usando download direto..."
+            curl -L https://github.com/${{ github.repository }}/archive/main.tar.gz | tar xz --strip-components=1
+          }
+          
+          # Verificar se baixou corretamente
+          if [ ! -f "panel/backend/server.js" ]; then
+            log "❌ Estrutura do projeto não encontrada!"
+            ls -la
+            exit 1
+          fi
+          log "✅ Código baixado com sucesso"
+          
+          # ====================================
+          # ETAPA 3: INSTALAR DEPENDÊNCIAS DO SISTEMA
+          # ====================================
+          log "🚀 ETAPA 3: Instalando dependências do sistema..."
+          
+          # Atualizar sistema
+          apt-get update -qq
+          
+          # Instalar Node.js 18 LTS se necessário
+          if ! command -v node >/dev/null 2>&1 || [ "$(node -v | cut -d'v' -f2 | cut -d'.' -f1)" -lt "18" ]; then
+            log "📦 Instalando Node.js 18 LTS..."
+            curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+            apt-get install -y nodejs
+          else
+            log "✅ Node.js já instalado: $(node -v)"
+          fi
+          
+          # Instalar Docker se necessário
+          if ! command -v docker >/dev/null 2>&1; then
+            log "📦 Instalando Docker..."
+            curl -fsSL https://get.docker.com | sh
+            systemctl start docker
+            systemctl enable docker
+          else
+            log "✅ Docker já instalado: $(docker --version)"
+          fi
+          
+          # Verificar Docker Compose
+          if ! docker compose version >/dev/null 2>&1; then
+            log "📦 Instalando Docker Compose..."
+            apt-get install -y docker-compose-plugin
+          else
+            log "✅ Docker Compose já instalado: $(docker compose version)"
+          fi
+          
+          # Instalar PM2 para gerenciar processos Node.js
+          if ! command -v pm2 >/dev/null 2>&1; then
+            log "📦 Instalando PM2..."
+            npm install -g pm2
+          else
+            log "✅ PM2 já instalado: $(pm2 -v)"
+          fi
+          
+          # ====================================
+          # ETAPA 4: CONFIGURAR AMBIENTE
+          # ====================================
+          log "🚀 ETAPA 4: Configurando ambiente..."
+          
+          # Criar diretórios necessários
+          mkdir -p panel/data
+          mkdir -p docker/instances
+          
+          # Definir IP da VPS nas configurações
+          VPS_IP="${{ env.VPS_HOST }}"
+          
+          # Criar arquivo de configuração do ambiente
+          cat > panel/.env << EOF
+          NODE_ENV=production
+          PORT=5000
+          VPS_IP=$VPS_IP
+          DOCKER_PATH=$APP_DIR/docker
+          DATA_PATH=$APP_DIR/panel/data
+          EOF
+          
+          # ====================================
+          # ETAPA 5: INSTALAR DEPENDÊNCIAS DO PROJETO
+          # ====================================
+          log "🚀 ETAPA 5: Instalando dependências do projeto..."
+          
+          # Backend dependencies
+          cd $APP_DIR/panel/backend
+          log "📦 Instalando dependências do backend..."
+          npm install --production
+          
+          # Frontend dependencies e build
+          cd $APP_DIR/panel/frontend
+          log "📦 Instalando dependências do frontend..."
+          npm install
+          
+          log "🏗️ Fazendo build do frontend..."
+          npm run build
+          
+          # ====================================
+          # ETAPA 6: CONFIGURAR NGINX
+          # ====================================
+          log "🚀 ETAPA 6: Configurando Nginx..."
+          
+          # Instalar Nginx se necessário
+          if ! command -v nginx >/dev/null 2>&1; then
+            log "📦 Instalando Nginx..."
+            apt-get install -y nginx
+          fi
+          
+          # Configurar Nginx para servir a aplicação
+          cat > /etc/nginx/sites-available/supabase-panel << 'EOF'
+          server {
+              listen 80;
+              server_name _;
+              
+              # Servir arquivos estáticos do frontend
+              location / {
+                  root /opt/supabase-panel/panel/frontend/dist;
+                  try_files $uri $uri/ /index.html;
+              }
+              
+              # Proxy para API do backend
+              location /api/ {
+                  proxy_pass http://localhost:5000;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_cache_bypass $http_upgrade;
+              }
+          }
+          EOF
+          
+          # Ativar site
+          ln -sf /etc/nginx/sites-available/supabase-panel /etc/nginx/sites-enabled/
+          rm -f /etc/nginx/sites-enabled/default
+          
+          # Testar configuração do Nginx
+          nginx -t || {
+            log "❌ Erro na configuração do Nginx"
+            exit 1
+          }
+          
+          # ====================================
+          # ETAPA 7: INICIAR SERVIÇOS
+          # ====================================
+          log "🚀 ETAPA 7: Iniciando serviços..."
+          
+          cd $APP_DIR
+          
+          # Parar PM2 existente
+          pm2 delete all 2>/dev/null || true
+          
+          # Iniciar backend com PM2
+          cd panel/backend
+          pm2 start server.js --name "supabase-panel-backend" --env production
+          
+          # Reiniciar Nginx
+          systemctl restart nginx
+          systemctl enable nginx
+          
+          # ====================================
+          # ETAPA 8: VERIFICAÇÕES DE SAÚDE
+          # ====================================
+          log "🚀 ETAPA 8: Verificando deployment..."
+          
+          # Aguardar serviços iniciarem
+          log "⏳ Aguardando serviços iniciarem..."
+          sleep 10
+          
+          # Verificar status dos serviços
+          log "📋 Status dos serviços:"
+          
+          FAILED_SERVICES=""
+          
+          # Verificar PM2
+          if pm2 list | grep -q "supabase-panel-backend.*online"; then
+            log "✅ Backend (PM2): OK"
+          else
+            log "❌ Backend (PM2): FALHOU"
+            FAILED_SERVICES="$FAILED_SERVICES backend"
+            pm2 logs supabase-panel-backend --lines 10
+          fi
+          
+          # Verificar Nginx
+          if systemctl is-active --quiet nginx; then
+            log "✅ Nginx: OK"
+          else
+            log "❌ Nginx: FALHOU"
+            FAILED_SERVICES="$FAILED_SERVICES nginx"
+            systemctl status nginx
+          fi
+          
+          # Verificar Docker
+          if systemctl is-active --quiet docker; then
+            log "✅ Docker: OK"
+          else
+            log "❌ Docker: FALHOU"
+            FAILED_SERVICES="$FAILED_SERVICES docker"
+          fi
+          
+          # Health checks HTTP
+          sleep 5
+          
+          # Testar frontend
+          if curl -f -s http://localhost/ >/dev/null 2>&1; then
+            log "✅ Frontend (HTTP): OK"
+          else
+            log "❌ Frontend (HTTP): FALHOU"
+            FAILED_SERVICES="$FAILED_SERVICES frontend"
+          fi
+          
+          # Testar API backend
+          if curl -f -s http://localhost/api/info >/dev/null 2>&1; then
+            log "✅ Backend API: OK"
+          else
+            log "❌ Backend API: FALHOU"
+            FAILED_SERVICES="$FAILED_SERVICES api"
+          fi
+          
+          # ====================================
+          # ETAPA 9: CONFIGURAR AUTO-START
+          # ====================================
+          log "🚀 ETAPA 9: Configurando auto-start..."
+          
+          # Salvar configuração do PM2 para auto-start
+          pm2 save
+          pm2 startup systemd -u root --hp /root
+          
+          # ====================================
+          # ETAPA 10: RESULTADO FINAL
+          # ====================================
+          if [ -n "$FAILED_SERVICES" ]; then
+            log "❌ DEPLOY COM PROBLEMAS. Serviços com falha:$FAILED_SERVICES"
+            log "📋 Logs dos serviços:"
+            pm2 logs --lines 20
+            systemctl status nginx --no-pager
+            exit 1
+          else
+            log "🎉 DEPLOY DO SUPABASE PANEL CONCLUÍDO COM SUCESSO!"
+            log "🌐 Aplicação disponível em:"
+            log "   - http://${{ env.VPS_HOST }} (Supabase Panel - Interface Principal)"
+            log "   - http://${{ env.VPS_HOST }}/api/info (Backend API)"
+            log ""
+            log "📊 Resumo dos serviços ativos:"
+            pm2 list
+            log ""
+            log "🐳 Docker pronto para criar instâncias Supabase"
+            log "💡 Use o painel web para criar e gerenciar instâncias"
+            log ""
+            log "🔧 Comandos úteis na VPS:"
+            log "   - pm2 logs supabase-panel-backend  # Ver logs do backend"
+            log "   - pm2 restart supabase-panel-backend  # Reiniciar backend"
+            log "   - systemctl status nginx  # Status do Nginx"
+            log "   - docker ps  # Ver instâncias Supabase ativas"
+          fi
